@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, Text, Float, Enum as SAEnum, Boolean
+from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, Text, Float, Enum as SAEnum, Boolean, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
 from database import Base
@@ -67,6 +67,12 @@ class StarLevel(Base):
 class PointsType(str, enum.Enum):
     EARN = "获得"
     SPEND = "消耗"
+    # 预占不是独立余额：冻结/解冻/结算均成对记录在同一张积分流水表，
+    # 可用积分 = 累计获得 - 累计消耗 - 冻结中的支出，任何时候都能用流水还原。
+    FREEZE = "冻结"
+    UNFREEZE = "解冻"
+    SETTLE_SPEND = "结算支出"
+    SETTLE_REFUND = "结算退回"
 
 
 class PointsSource(str, enum.Enum):
@@ -74,7 +80,12 @@ class PointsSource(str, enum.Enum):
     TEACHER_RATING = "老师好评"
     EXCHANGE_BADGE = "兑换徽章"
     EXCHANGE_PRIORITY_SLOT = "兑换优先时段"
-    OTHER = "其他"
+    EXCHANGE_RESERVE = "兑换预占"
+    EXCHANGE_RELEASE = "兑换释放"
+    EXCHANGE_SETTLE = "兑换结算"
+    MANUAL_COMPENSATION = "人工补偿"
+    PRIORITY_USE = "优先券核销"
+    OTHER = "其他权益"
 
 
 class BenefitType(str, enum.Enum):
@@ -84,9 +95,50 @@ class BenefitType(str, enum.Enum):
 
 
 class ExchangeStatus(str, enum.Enum):
-    PENDING = "待处理"
+    # 申请即预占：RESERVED 表示积分与库存都已原子锁定；确认后进入 CONFIRMED。
+    RESERVED = "已预占"
+    PENDING = "待处理"              # 兼容旧数据
+    CONFIRMED = "已确认待履约"
+    PARTIALLY_FULFILLED = "部分履约"
     COMPLETED = "已完成"
+    REJECTED = "已拒绝"
     CANCELLED = "已取消"
+    TIMEOUT_CANCELLED = "超时取消"
+
+
+class ReleaseReason(str, enum.Enum):
+    TIMEOUT = "超时释放"
+    REJECTED = "后台拒绝"
+    USER_CANCEL = "家长取消"
+    PARTIAL_RELEASE = "部分履约释放"
+
+
+class ExchangeEventType(str, enum.Enum):
+    RESERVE = "申请预占"
+    CONFIRM = "后台确认"
+    FULFILL = "实物履约"
+    PARTIAL_FULFILL = "部分履约"
+    REJECT = "拒绝"
+    CANCEL = "取消"
+    TIMEOUT = "超时取消"
+    COMPENSATE = "人工补偿"
+    COUPON_USE = "优先券核销"
+    COUPON_RETURN = "优先券退回"
+
+
+class CompensationType(str, enum.Enum):
+    POINTS_REFUND = "补退积分"
+    POINTS_DEDUCT = "补扣积分"
+    STOCK_RETURN = "补回库存"
+    STOCK_DEDUCT = "补扣库存"
+
+
+class CouponStatus(str, enum.Enum):
+    # 优先时段券：兑换确认只是发放资格，真正使用（核销时段）才消费资格。
+    ISSUED = "已发放"
+    USED = "已使用"
+    RETURNED = "已退回"
+    EXPIRED = "已过期"
 
 
 class Volunteer(Base):
@@ -105,6 +157,8 @@ class Volunteer(Base):
     star_level_id = Column(Integer, ForeignKey("star_levels.id"))
     total_service_hours = Column(Float, default=0.0)
     points_balance = Column(Integer, default=0)
+    # 已预占但尚未结算/释放的积分：可用积分 = points_balance - points_frozen
+    points_frozen = Column(Integer, default=0, nullable=False)
     registration_date = Column(Date, default=date.today)
     certification_date = Column(Date)
     notes = Column(Text)
@@ -378,12 +432,15 @@ class PointsRecord(Base):
     source = Column(SAEnum(PointsSource), nullable=False)
     service_record_id = Column(Integer, ForeignKey("service_records.id"))
     exchange_id = Column(Integer, ForeignKey("benefit_exchanges.id"))
+    # 每一条冻结/解冻/结算流水都挂到具体兑换事件上，保证逐笔可解释。
+    exchange_event_id = Column(Integer, ForeignKey("exchange_events.id"))
     description = Column(String(200))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     volunteer = relationship("Volunteer", back_populates="points_records")
     service_record = relationship("ServiceRecord")
-    exchange = relationship("BenefitExchange", back_populates="points_record")
+    exchange = relationship("BenefitExchange", back_populates="points_records")
+    exchange_event = relationship("ExchangeEvent", back_populates="points_records")
 
 
 class Benefit(Base):
@@ -395,6 +452,9 @@ class Benefit(Base):
     description = Column(Text)
     points_cost = Column(Integer, nullable=False)
     stock = Column(Integer, default=0)
+    # 已售罄承诺数量（已预占 + 已履约，未因取消/拒绝释放）。
+    # 库存守恒：stock + committed_quantity = 初始可售量（人工补偿以流水另行解释差异）。
+    committed_quantity = Column(Integer, default=0, nullable=False)
     is_active = Column(Boolean, default=True)
     image_url = Column(String(500))
     sort_order = Column(Integer, default=0)
@@ -409,18 +469,152 @@ class BenefitExchange(Base):
     id = Column(Integer, primary_key=True, index=True)
     volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False)
     benefit_id = Column(Integer, ForeignKey("benefits.id"), nullable=False)
+    # 申请时按当时单价锁定的积分总额，后续确认/取消均以此为准，单价漂移不影响在途兑换。
     points_spent = Column(Integer, nullable=False)
-    status = Column(SAEnum(ExchangeStatus), default=ExchangeStatus.PENDING)
+    status = Column(SAEnum(ExchangeStatus), default=ExchangeStatus.RESERVED)
     quantity = Column(Integer, default=1)
+    # 幂等键：家长端重试携带同一 request_no 必须返回同一笔兑换；
+    # request_payload_hash 记录申请载荷指纹，载荷变化识别为 409 冲突。
+    request_no = Column(String(64), unique=True, index=True)
+    request_payload_hash = Column(String(64))
+    # 数量账：reserved=已预占未履约，fulfilled=已履约，released=已释放，三者守恒 quantity = reserved + fulfilled + released
+    reserved_quantity = Column(Integer, default=0, nullable=False)
+    fulfilled_quantity = Column(Integer, default=0, nullable=False)
+    released_quantity = Column(Integer, default=0, nullable=False)
+    # 积分账：frozen=冻结中，settled=已结算毛额；
+    # released=预占后整单释放回可用（取消/拒绝/超时）；refunded=已结算后退回（部分履约/补偿）
+    # points_spent = frozen + settled + released
+    points_frozen = Column(Integer, default=0, nullable=False)
+    points_settled = Column(Integer, default=0, nullable=False)
+    points_released = Column(Integer, default=0, nullable=False)
+    points_refunded = Column(Integer, default=0, nullable=False)
+    expires_at = Column(DateTime)
+    confirmed_at = Column(DateTime)
     delivery_info = Column(Text)
     fulfilled_at = Column(DateTime)
+    cancel_reason = Column(SAEnum(ReleaseReason))
     notes = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     volunteer = relationship("Volunteer", back_populates="benefit_exchanges")
     benefit = relationship("Benefit", back_populates="exchanges")
-    points_record = relationship("PointsRecord", back_populates="exchange", uselist=False)
+    points_records = relationship("PointsRecord", back_populates="exchange")
+    events = relationship("ExchangeEvent", back_populates="exchange",
+                          cascade="all, delete-orphan", order_by="ExchangeEvent.id")
+    fulfillments = relationship("FulfillmentItem", back_populates="exchange",
+                                cascade="all, delete-orphan", order_by="FulfillmentItem.id")
+    coupons = relationship("PriorityCoupon", back_populates="exchange",
+                           cascade="all, delete-orphan")
+    compensations = relationship("ManualCompensation", back_populates="exchange",
+                                 cascade="all, delete-orphan", order_by="ManualCompensation.id")
+
+
+class ExchangeEvent(Base):
+    """兑换全生命周期事件流：每个状态迁移与资源变动追加一条，永不修改删除。"""
+    __tablename__ = "exchange_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    exchange_id = Column(Integer, ForeignKey("benefit_exchanges.id"), nullable=False, index=True)
+    event_type = Column(SAEnum(ExchangeEventType), nullable=False)
+    from_status = Column(SAEnum(ExchangeStatus))
+    to_status = Column(SAEnum(ExchangeStatus))
+    quantity = Column(Integer, default=0)
+    points_amount = Column(Integer, default=0)
+    reason = Column(SAEnum(ReleaseReason))
+    detail = Column(Text)
+    operator = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    exchange = relationship("BenefitExchange", back_populates="events")
+    points_records = relationship("PointsRecord", back_populates="exchange_event")
+
+
+class FulfillmentItem(Base):
+    """实物权益逐批复品记录，支持部分履约。"""
+    __tablename__ = "fulfillment_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    exchange_id = Column(Integer, ForeignKey("benefit_exchanges.id"), nullable=False, index=True)
+    # 幂等键：后台重复提交同一批复品请求不重复出库
+    request_no = Column(String(64), unique=True, index=True)
+    quantity = Column(Integer, nullable=False)
+    delivery_info = Column(Text)
+    operator = Column(String(50))
+    remark = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    exchange = relationship("BenefitExchange", back_populates="fulfillments")
+
+
+class StockChangeType(str, enum.Enum):
+    INITIAL = "初始入库"
+    RESERVE = "预占出库"
+    RELEASE = "释放回库"
+    FULFILL = "履约出库"
+    COMPENSATE_IN = "补偿回库"
+    COMPENSATE_OUT = "补偿扣库"
+
+
+class StockLedger(Base):
+    """库存流水：每一笔 stock/committed 变动都追加记录，可售库存与已承诺数量逐笔可解释。"""
+    __tablename__ = "stock_ledger"
+
+    id = Column(Integer, primary_key=True, index=True)
+    benefit_id = Column(Integer, ForeignKey("benefits.id"), nullable=False, index=True)
+    exchange_id = Column(Integer, ForeignKey("benefit_exchanges.id"), index=True)
+    change_type = Column(SAEnum(StockChangeType), nullable=False)
+    quantity = Column(Integer, nullable=False)            # 可售库存变动（正入库/负出库）
+    committed_delta = Column(Integer, nullable=False, default=0)  # 已承诺数量变动
+    stock_after = Column(Integer, nullable=False)
+    committed_after = Column(Integer, nullable=False)
+    event_id = Column(Integer, ForeignKey("exchange_events.id"))
+    operator = Column(String(50))
+    remark = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    benefit = relationship("Benefit")
+    exchange = relationship("BenefitExchange")
+
+
+class PriorityCoupon(Base):
+    """优先认领时段券：确认发放资格，核销（绑定讲解时段）时才真正消费。"""
+    __tablename__ = "priority_coupons"
+
+    id = Column(Integer, primary_key=True, index=True)
+    exchange_id = Column(Integer, ForeignKey("benefit_exchanges.id"), nullable=False, index=True)
+    volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False, index=True)
+    benefit_id = Column(Integer, ForeignKey("benefits.id"), nullable=False)
+    coupon_no = Column(String(64), unique=True, nullable=False, index=True)
+    status = Column(SAEnum(CouponStatus), default=CouponStatus.ISSUED, nullable=False)
+    time_slot_id = Column(Integer, ForeignKey("time_slots.id"))
+    used_at = Column(DateTime)
+    issued_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    exchange = relationship("BenefitExchange", back_populates="coupons")
+    volunteer = relationship("Volunteer")
+    benefit = relationship("Benefit")
+    time_slot = relationship("TimeSlot", foreign_keys=[time_slot_id])
+
+
+class ManualCompensation(Base):
+    """后台人工更正只能追加补偿记录，永不改写既有流水与状态字段。"""
+    __tablename__ = "manual_compensations"
+    __table_args__ = (
+        UniqueConstraint("exchange_id", "request_no", name="uq_compensation_request_no"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    exchange_id = Column(Integer, ForeignKey("benefit_exchanges.id"), nullable=False, index=True)
+    request_no = Column(String(64))
+    compensation_type = Column(SAEnum(CompensationType), nullable=False)
+    amount = Column(Integer, nullable=False)
+    reason = Column(Text, nullable=False)
+    operator = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    exchange = relationship("BenefitExchange", back_populates="compensations")
 
 
 class StarCertificate(Base):

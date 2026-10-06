@@ -1,9 +1,12 @@
-import os, sys
+import os, sys, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-if os.path.exists("redscarf.db"):
-    os.remove("redscarf.db")
+# 使用独立的验收数据库，避免与开发/测试用 redscarf.db 互相删除（WAL 还含 -wal/-shm）
+os.environ.setdefault("DATABASE_URL", "sqlite:///./redscarf_acceptance.db")
+_db_name = os.environ["DATABASE_URL"].replace("sqlite:///./", "")
+for f in glob.glob(_db_name + "*"):
+    os.remove(f)
 
 from fastapi.testclient import TestClient
 from main import app
@@ -146,22 +149,47 @@ assert r.status_code == 200
 points_stats = r.json()
 print(f"  ✅ 总发放积分: {points_stats['total_points_earned']}, 总消耗: {points_stats['total_points_spent']}, 净积分: {points_stats['net_points']}")
 
-print("\n[15/18] 兑换权益商品...")
+print("\n[15/18] 兑换权益商品（预占 → 后台确认结算）...")
 if points_data["points_balance"] >= 30:
     r = client.post("/api/benefits/exchanges", json={
         "volunteer_id": test_vol["id"],
         "benefit_id": [b["id"] for b in benefits if b["benefit_type"] == "其他权益"][0],
         "quantity": 1,
         "delivery_info": "测试兑换",
-        "notes": "API测试"
+        "notes": "API测试",
+        "request_no": "acceptance-req-001"
     })
-    assert r.status_code == 200, f"失败: {r.status_code} {r.text}"
+    assert r.status_code == 201, f"失败: {r.status_code} {r.text}"
     exchange = r.json()
-    print(f"  ✅ 兑换成功: #{exchange['id']} 花费{exchange['points_spent']}积分 状态={exchange['status']}")
+    print(f"  ✅ 预占成功: #{exchange['id']} 冻结{exchange['points_frozen']}积分 状态={exchange['status']}")
+
+    # 相同请求重试（含超时重试）必须返回同一结果
+    r_retry = client.post("/api/benefits/exchanges", json={
+        "volunteer_id": test_vol["id"],
+        "benefit_id": exchange["benefit_id"],
+        "quantity": 1,
+        "delivery_info": "测试兑换",
+        "notes": "API测试",
+        "request_no": "acceptance-req-001"
+    })
+    assert r_retry.status_code == 201 and r_retry.json()["id"] == exchange["id"]
+    # 相同编号但载荷变化必须识别为冲突
+    r_conflict = client.post("/api/benefits/exchanges", json={
+        "volunteer_id": test_vol["id"],
+        "benefit_id": exchange["benefit_id"],
+        "quantity": 2,
+        "request_no": "acceptance-req-001"
+    })
+    assert r_conflict.status_code == 409, f"应判定冲突: {r_conflict.status_code}"
+
+    r2 = client.post(f"/api/benefits/exchanges/{exchange['id']}/confirm", json={"operator": "验收脚本"})
+    assert r2.status_code == 200, f"确认失败: {r2.status_code} {r2.text}"
+    confirmed = r2.json()
+    print(f"  ✅ 后台确认: 状态={confirmed['status']} 已结算{confirmed['points_settled']}积分")
 
     r = client.get(f"/api/points/volunteer/{test_vol['id']}")
     new_balance = r.json()["points_balance"]
-    print(f"  ✅ 兑换后积分余额: {new_balance}")
+    print(f"  ✅ 确认后积分余额: {new_balance}（可用 {r.json()['points_available']}）")
 else:
     print(f"  ⏭️  跳过（积分不足）")
 

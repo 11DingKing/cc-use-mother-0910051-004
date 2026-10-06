@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List
 from database import get_db
 import models, schemas
+import exchange_service
 
 router = APIRouter(prefix="/api/time-slots", tags=["讲解时段"])
 
@@ -79,6 +80,8 @@ def cancel_time_slot(slot_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="时段不存在")
     if slot.status not in [models.TimeSlotStatus.CLAIMED, models.TimeSlotStatus.AVAILABLE]:
         raise HTTPException(status_code=400, detail="当前状态不可取消")
+    # 若该时段是用优先券认领的，先退回券资格（追加 COUPON_RETURN 事件）。
+    exchange_service.return_coupon_for_slot(db, slot_id)
     slot.status = models.TimeSlotStatus.CANCELLED
     db.commit()
     db.refresh(slot)

@@ -46,6 +46,7 @@ def get_parent_view(volunteer_id: int, parent_phone: str = None, db: Session = D
 
     star_level_name = volunteer.star_level.name if volunteer.star_level else None
 
+    frozen = volunteer.points_frozen or 0
     summary = schemas.ParentVolunteerSummary(
         volunteer_id=volunteer.id,
         name=volunteer.name,
@@ -53,6 +54,8 @@ def get_parent_view(volunteer_id: int, parent_phone: str = None, db: Session = D
         star_level_name=star_level_name,
         total_service_hours=volunteer.total_service_hours or 0.0,
         points_balance=volunteer.points_balance or 0,
+        points_frozen=frozen,
+        points_available=(volunteer.points_balance or 0) - frozen,
         registration_date=volunteer.registration_date,
         certification_date=volunteer.certification_date
     )

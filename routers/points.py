@@ -7,6 +7,10 @@ import models, schemas
 
 router = APIRouter(prefix="/api/points", tags=["积分管理"])
 
+# 计入"获得/消耗"合计的流水类型（冻结/解冻只是预占搬运，不影响总额）
+_EARN_TYPES = (models.PointsType.EARN, models.PointsType.SETTLE_REFUND)
+_SPEND_TYPES = (models.PointsType.SPEND, models.PointsType.SETTLE_SPEND)
+
 
 def add_points(db: Session, volunteer_id: int, points: int, source: models.PointsSource,
                description: str = None, service_record_id: int = None, exchange_id: int = None):
@@ -29,13 +33,13 @@ def add_points(db: Session, volunteer_id: int, points: int, source: models.Point
         exchange_id=exchange_id
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    # 只刷入当前事务，由调用方统一提交，保证"加分+业务数据"原子落库。
+    db.flush()
     return record
 
 
 def spend_points(db: Session, volunteer_id: int, points: int, source: models.PointsSource,
-                description: str = None, exchange_id: int = None):
+                description: str = None, exchange_id: int = None, service_record_id: int = None):
     if points <= 0:
         return None
 
@@ -43,8 +47,8 @@ def spend_points(db: Session, volunteer_id: int, points: int, source: models.Poi
     if not volunteer:
         raise HTTPException(status_code=404, detail="志愿者不存在")
 
-    if (volunteer.points_balance or 0) < points:
-        raise HTTPException(status_code=400, detail="积分不足")
+    if (volunteer.points_balance or 0) - (volunteer.points_frozen or 0) < points:
+        raise HTTPException(status_code=400, detail="积分不足（含冻结积分校验）")
 
     volunteer.points_balance -= points
 
@@ -54,12 +58,21 @@ def spend_points(db: Session, volunteer_id: int, points: int, source: models.Poi
         points_amount=points,
         source=source,
         description=description,
-        exchange_id=exchange_id
+        exchange_id=exchange_id,
+        service_record_id=service_record_id
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    db.flush()
     return record
+
+
+def _points_totals(db, volunteer_id: int):
+    def sum_types(types):
+        return db.query(func.coalesce(func.sum(models.PointsRecord.points_amount), 0)).filter(
+            models.PointsRecord.volunteer_id == volunteer_id,
+            models.PointsRecord.points_type.in_(types)
+        ).scalar() or 0
+    return sum_types(_EARN_TYPES), sum_types(_SPEND_TYPES)
 
 
 @router.get("/records", response_model=List[schemas.PointsRecord])
@@ -73,7 +86,7 @@ def list_points_records(volunteer_id: int = None, points_type: str = None,
         query = query.filter(models.PointsRecord.points_type == points_type)
     if source:
         query = query.filter(models.PointsRecord.source == source)
-    return query.order_by(models.PointsRecord.created_at.desc()).offset(skip).limit(limit).all()
+    return query.order_by(models.PointsRecord.created_at.desc(), models.PointsRecord.id.desc()).offset(skip).limit(limit).all()
 
 
 @router.get("/volunteer/{volunteer_id}", response_model=schemas.VolunteerPoints)
@@ -82,20 +95,15 @@ def get_volunteer_points(volunteer_id: int, db: Session = Depends(get_db)):
     if not volunteer:
         raise HTTPException(status_code=404, detail="志愿者不存在")
 
-    total_earned = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-        models.PointsRecord.volunteer_id == volunteer_id,
-        models.PointsRecord.points_type == models.PointsType.EARN
-    ).scalar() or 0
-
-    total_spent = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-        models.PointsRecord.volunteer_id == volunteer_id,
-        models.PointsRecord.points_type == models.PointsType.SPEND
-    ).scalar() or 0
+    total_earned, total_spent = _points_totals(db, volunteer_id)
+    frozen = volunteer.points_frozen or 0
 
     return schemas.VolunteerPoints(
         volunteer_id=volunteer_id,
         name=volunteer.name,
         points_balance=volunteer.points_balance or 0,
+        points_frozen=frozen,
+        points_available=(volunteer.points_balance or 0) - frozen,
         total_earned=total_earned,
         total_spent=total_spent
     )
@@ -110,7 +118,7 @@ def get_volunteer_points_records(volunteer_id: int, skip: int = 0, limit: int = 
 
     return db.query(models.PointsRecord).filter(
         models.PointsRecord.volunteer_id == volunteer_id
-    ).order_by(models.PointsRecord.created_at.desc()).offset(skip).limit(limit).all()
+    ).order_by(models.PointsRecord.created_at.desc(), models.PointsRecord.id.desc()).offset(skip).limit(limit).all()
 
 
 @router.post("/manual-adjust", response_model=schemas.PointsRecord)
@@ -122,8 +130,9 @@ def manual_adjust_points(adjust: schemas.PointsRecordCreate, db: Session = Depen
     if adjust.points_type == models.PointsType.EARN:
         volunteer.points_balance = (volunteer.points_balance or 0) + adjust.points_amount
     else:
-        if (volunteer.points_balance or 0) < adjust.points_amount:
-            raise HTTPException(status_code=400, detail="积分不足")
+        available = (volunteer.points_balance or 0) - (volunteer.points_frozen or 0)
+        if available < adjust.points_amount:
+            raise HTTPException(status_code=400, detail="积分不足（含冻结积分校验）")
         volunteer.points_balance -= adjust.points_amount
 
     record = models.PointsRecord(**adjust.model_dump())
@@ -135,26 +144,23 @@ def manual_adjust_points(adjust: schemas.PointsRecordCreate, db: Session = Depen
 
 @router.get("/stats", response_model=schemas.PointsStats)
 def get_points_stats(db: Session = Depends(get_db)):
-    total_earned = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-        models.PointsRecord.points_type == models.PointsType.EARN
-    ).scalar() or 0
+    def sum_all(types):
+        return db.query(func.coalesce(func.sum(models.PointsRecord.points_amount), 0)).filter(
+            models.PointsRecord.points_type.in_(types)
+        ).scalar() or 0
 
-    total_spent = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-        models.PointsRecord.points_type == models.PointsType.SPEND
-    ).scalar() or 0
+    def count_all(types):
+        return db.query(func.count(models.PointsRecord.id)).filter(
+            models.PointsRecord.points_type.in_(types)
+        ).scalar() or 0
 
-    earn_count = db.query(func.count(models.PointsRecord.id)).filter(
-        models.PointsRecord.points_type == models.PointsType.EARN
-    ).scalar() or 0
-
-    spend_count = db.query(func.count(models.PointsRecord.id)).filter(
-        models.PointsRecord.points_type == models.PointsType.SPEND
-    ).scalar() or 0
+    total_earned = sum_all(_EARN_TYPES)
+    total_spent = sum_all(_SPEND_TYPES)
 
     return schemas.PointsStats(
         total_points_earned=total_earned,
         total_points_spent=total_spent,
         net_points=total_earned - total_spent,
-        earn_count=earn_count,
-        spend_count=spend_count
+        earn_count=count_all(_EARN_TYPES),
+        spend_count=count_all(_SPEND_TYPES)
     )

@@ -3,7 +3,8 @@ from datetime import date, datetime
 from typing import Optional, List
 from models import (
     VolunteerStatus, AssessmentResult, TimeSlotStatus, TrainingBatchStatus, EnrollmentStatus,
-    PointsType, PointsSource, BenefitType, ExchangeStatus
+    PointsType, PointsSource, BenefitType, ExchangeStatus, ReleaseReason, CouponStatus,
+    CompensationType
 )
 
 
@@ -629,6 +630,8 @@ class VolunteerPoints(BaseModel):
     volunteer_id: int
     name: str
     points_balance: int
+    points_frozen: int = 0
+    points_available: int = 0
     total_earned: int
     total_spent: int
 
@@ -661,6 +664,7 @@ class BenefitUpdate(BaseModel):
 
 class Benefit(BenefitBase):
     id: int
+    committed_quantity: int = 0
     created_at: datetime
 
     class Config:
@@ -676,6 +680,22 @@ class BenefitExchangeBase(BaseModel):
 class BenefitExchangeCreate(BenefitExchangeBase):
     delivery_info: Optional[str] = None
     notes: Optional[str] = None
+    # 家长端每次申请生成并持久保存的请求编号；超时重试必须原样重发。
+    request_no: Optional[str] = None
+
+
+class ExchangeAction(BaseModel):
+    operator: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ExchangeFulfill(BaseModel):
+    quantity: int = Field(gt=0)
+    release_remaining: bool = False
+    delivery_info: Optional[str] = None
+    operator: Optional[str] = None
+    remark: Optional[str] = None
+    request_no: Optional[str] = None
 
 
 class BenefitExchangeUpdate(BaseModel):
@@ -684,23 +704,132 @@ class BenefitExchangeUpdate(BaseModel):
     notes: Optional[str] = None
 
 
-class BenefitExchange(BaseModel):
+class ExchangeEvent(BaseModel):
     id: int
-    volunteer_id: int
-    benefit_id: int
-    points_spent: int
-    status: ExchangeStatus
+    event_type: str
+    from_status: Optional[ExchangeStatus] = None
+    to_status: Optional[ExchangeStatus] = None
+    quantity: int = 0
+    points_amount: int = 0
+    reason: Optional[ReleaseReason] = None
+    detail: Optional[str] = None
+    operator: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FulfillmentItem(BaseModel):
+    id: int
     quantity: int
     delivery_info: Optional[str] = None
+    operator: Optional[str] = None
+    remark: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ManualCompensationCreate(BaseModel):
+    compensation_type: CompensationType
+    amount: int = Field(gt=0)
+    reason: str
+    operator: Optional[str] = None
+    request_no: Optional[str] = None
+
+
+class ManualCompensation(BaseModel):
+    id: int
+    exchange_id: int
+    request_no: Optional[str] = None
+    compensation_type: CompensationType
+    amount: int
+    reason: str
+    operator: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BenefitExchange(BenefitExchangeBase):
+    id: int
+    request_no: Optional[str] = None
+    points_spent: int
+    status: ExchangeStatus
+    reserved_quantity: int = 0
+    fulfilled_quantity: int = 0
+    released_quantity: int = 0
+    points_frozen: int = 0
+    points_settled: int = 0
+    points_released: int = 0
+    points_refunded: int = 0
+    expires_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    delivery_info: Optional[str] = None
     fulfilled_at: Optional[datetime] = None
+    cancel_reason: Optional[ReleaseReason] = None
     notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     volunteer: Optional["Volunteer"] = None
     benefit: Optional[Benefit] = None
+    events: List[ExchangeEvent] = []
+    fulfillments: List[FulfillmentItem] = []
+    compensations: List[ManualCompensation] = []
 
     class Config:
         from_attributes = True
+
+
+class BenefitExchangeDetail(BenefitExchange):
+    pass
+
+
+class PriorityCoupon(BaseModel):
+    id: int
+    exchange_id: int
+    volunteer_id: int
+    benefit_id: int
+    coupon_no: str
+    status: CouponStatus
+    time_slot_id: Optional[int] = None
+    used_at: Optional[datetime] = None
+    issued_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CouponUse(BaseModel):
+    time_slot_id: int
+
+
+class ExchangeStockSnapshot(BaseModel):
+    benefit_id: int
+    name: str
+    sellable_stock: int
+    committed_quantity: int
+    reserved_in_exchanges: int
+    fulfilled_quantity: int
+    released_quantity: int
+    quantity_account_balanced: bool
+    stock_matches_ledger: bool
+    consistent: bool
+
+
+class ExchangePointsSnapshot(BaseModel):
+    volunteer_id: int
+    name: str
+    points_balance: int
+    points_frozen: int
+    points_available: int
+    ledger_balance: int
+    ledger_frozen: int
+    frozen_in_exchanges: int
+    consistent: bool
 
 
 class StarCertificateBase(BaseModel):
@@ -741,6 +870,8 @@ class ParentVolunteerSummary(BaseModel):
     star_level_name: Optional[str] = None
     total_service_hours: float
     points_balance: int
+    points_frozen: int = 0
+    points_available: int = 0
     registration_date: date
     certification_date: Optional[date] = None
 

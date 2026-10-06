@@ -8,6 +8,16 @@ from datetime import date, datetime
 
 router = APIRouter(prefix="/api/stats", tags=["统计分析"])
 
+# 冻结/解冻是预占搬运，不计入获得/消耗合计；结算退回冲减消耗。
+_EARN_TYPES = (models.PointsType.EARN, models.PointsType.SETTLE_REFUND)
+_SPEND_TYPES = (models.PointsType.SPEND, models.PointsType.SETTLE_SPEND)
+_RESERVED_STATUSES = (models.ExchangeStatus.RESERVED, models.ExchangeStatus.PENDING)
+_CANCELLED_STATUSES = (
+    models.ExchangeStatus.CANCELLED,
+    models.ExchangeStatus.TIMEOUT_CANCELLED,
+    models.ExchangeStatus.REJECTED,
+)
+
 
 @router.get("/overview", response_model=schemas.OverviewStats)
 def get_overview_stats(db: Session = Depends(get_db)):
@@ -346,28 +356,25 @@ def get_topic_assessment_stats(db: Session = Depends(get_db)):
 
 @router.get("/points", response_model=schemas.PointsStats)
 def get_points_stats(db: Session = Depends(get_db)):
-    total_earned = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-        models.PointsRecord.points_type == models.PointsType.EARN
-    ).scalar() or 0
+    def _sum(types):
+        return db.query(func.coalesce(func.sum(models.PointsRecord.points_amount), 0)).filter(
+            models.PointsRecord.points_type.in_(types)
+        ).scalar() or 0
 
-    total_spent = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-        models.PointsRecord.points_type == models.PointsType.SPEND
-    ).scalar() or 0
+    def _count(types):
+        return db.query(func.count(models.PointsRecord.id)).filter(
+            models.PointsRecord.points_type.in_(types)
+        ).scalar() or 0
 
-    earn_count = db.query(func.count(models.PointsRecord.id)).filter(
-        models.PointsRecord.points_type == models.PointsType.EARN
-    ).scalar() or 0
-
-    spend_count = db.query(func.count(models.PointsRecord.id)).filter(
-        models.PointsRecord.points_type == models.PointsType.SPEND
-    ).scalar() or 0
+    total_earned = _sum(_EARN_TYPES)
+    total_spent = _sum(_SPEND_TYPES)
 
     return schemas.PointsStats(
         total_points_earned=total_earned,
         total_points_spent=total_spent,
         net_points=total_earned - total_spent,
-        earn_count=earn_count,
-        spend_count=spend_count
+        earn_count=_count(_EARN_TYPES),
+        spend_count=_count(_SPEND_TYPES)
     )
 
 
@@ -390,7 +397,7 @@ def get_monthly_points_stats(year: int = None, months: int = 12, db: Session = D
             and_(
                 models.PointsRecord.created_at >= month_start,
                 models.PointsRecord.created_at <= month_end,
-                models.PointsRecord.points_type == models.PointsType.EARN
+                models.PointsRecord.points_type.in_(_EARN_TYPES)
             )
         ).scalar() or 0
 
@@ -398,7 +405,7 @@ def get_monthly_points_stats(year: int = None, months: int = 12, db: Session = D
             and_(
                 models.PointsRecord.created_at >= month_start,
                 models.PointsRecord.created_at <= month_end,
-                models.PointsRecord.points_type == models.PointsType.SPEND
+                models.PointsRecord.points_type.in_(_SPEND_TYPES)
             )
         ).scalar() or 0
 
@@ -406,7 +413,7 @@ def get_monthly_points_stats(year: int = None, months: int = 12, db: Session = D
             and_(
                 models.PointsRecord.created_at >= month_start,
                 models.PointsRecord.created_at <= month_end,
-                models.PointsRecord.points_type == models.PointsType.EARN
+                models.PointsRecord.points_type.in_(_EARN_TYPES)
             )
         ).scalar() or 0
 
@@ -414,7 +421,7 @@ def get_monthly_points_stats(year: int = None, months: int = 12, db: Session = D
             and_(
                 models.PointsRecord.created_at >= month_start,
                 models.PointsRecord.created_at <= month_end,
-                models.PointsRecord.points_type == models.PointsType.SPEND
+                models.PointsRecord.points_type.in_(_SPEND_TYPES)
             )
         ).scalar() or 0
 
@@ -439,12 +446,12 @@ def get_points_by_source(db: Session = Depends(get_db)):
     for source in sources:
         total_earned = db.query(func.sum(models.PointsRecord.points_amount)).filter(
             models.PointsRecord.source == source,
-            models.PointsRecord.points_type == models.PointsType.EARN
+            models.PointsRecord.points_type.in_(_EARN_TYPES)
         ).scalar() or 0
 
         total_spent = db.query(func.sum(models.PointsRecord.points_amount)).filter(
             models.PointsRecord.source == source,
-            models.PointsRecord.points_type == models.PointsType.SPEND
+            models.PointsRecord.points_type.in_(_SPEND_TYPES)
         ).scalar() or 0
 
         count = db.query(func.count(models.PointsRecord.id)).filter(
@@ -467,20 +474,28 @@ def get_points_by_source(db: Session = Depends(get_db)):
 def get_exchange_stats(db: Session = Depends(get_db)):
     total_exchanges = db.query(func.count(models.BenefitExchange.id)).scalar() or 0
     pending_exchanges = db.query(func.count(models.BenefitExchange.id)).filter(
-        models.BenefitExchange.status == models.ExchangeStatus.PENDING
+        models.BenefitExchange.status.in_(_RESERVED_STATUSES)
+    ).scalar() or 0
+    in_progress = db.query(func.count(models.BenefitExchange.id)).filter(
+        models.BenefitExchange.status.in_([
+            models.ExchangeStatus.CONFIRMED,
+            models.ExchangeStatus.PARTIALLY_FULFILLED])
     ).scalar() or 0
     completed_exchanges = db.query(func.count(models.BenefitExchange.id)).filter(
         models.BenefitExchange.status == models.ExchangeStatus.COMPLETED
     ).scalar() or 0
     cancelled_exchanges = db.query(func.count(models.BenefitExchange.id)).filter(
-        models.BenefitExchange.status == models.ExchangeStatus.CANCELLED
+        models.BenefitExchange.status.in_(_CANCELLED_STATUSES)
     ).scalar() or 0
-    total_points_spent = db.query(func.sum(models.BenefitExchange.points_spent)).scalar() or 0
+    total_points_spent = db.query(
+        func.coalesce(func.sum(
+            models.BenefitExchange.points_settled - models.BenefitExchange.points_refunded), 0)
+    ).scalar() or 0
 
     return schemas.ExchangeStats(
         total_exchanges=total_exchanges,
         pending_exchanges=pending_exchanges,
-        completed_exchanges=completed_exchanges,
+        completed_exchanges=completed_exchanges + in_progress,
         cancelled_exchanges=cancelled_exchanges,
         total_points_spent=total_points_spent
     )
@@ -494,12 +509,16 @@ def get_exchange_by_benefit(db: Session = Depends(get_db)):
     for benefit in benefits:
         exchanges = db.query(models.BenefitExchange).filter(
             models.BenefitExchange.benefit_id == benefit.id,
-            models.BenefitExchange.status != models.ExchangeStatus.CANCELLED
+            ~models.BenefitExchange.status.in_(_CANCELLED_STATUSES)
         ).all()
 
         total_exchanged = len(exchanges)
-        total_quantity = sum(e.quantity for e in exchanges)
-        total_points = sum(e.points_spent for e in exchanges)
+        total_quantity = sum(
+            (e.fulfilled_quantity or 0) + (e.reserved_quantity or 0)
+            for e in exchanges)
+        total_points = sum(
+            (e.points_settled or 0) - (e.points_refunded or 0) + (e.points_frozen or 0)
+            for e in exchanges)
 
         result.append(schemas.BenefitStats(
             benefit_id=benefit.id,
@@ -543,7 +562,11 @@ def get_monthly_exchange_stats(year: int = None, months: int = 12, db: Session =
             )
         ).scalar() or 0
 
-        total_points = db.query(func.sum(models.BenefitExchange.points_spent)).filter(
+        total_points = db.query(func.coalesce(func.sum(
+            models.BenefitExchange.points_settled
+            - models.BenefitExchange.points_refunded
+            + models.BenefitExchange.points_frozen
+        ), 0)).filter(
             and_(
                 models.BenefitExchange.created_at >= month_start,
                 models.BenefitExchange.created_at <= month_end

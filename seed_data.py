@@ -71,15 +71,22 @@ def recompute_volunteer_hours(db: Session):
     db.flush()
 
     for volunteer in volunteers:
-        total_earned = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-            models.PointsRecord.volunteer_id == volunteer.id,
-            models.PointsRecord.points_type == models.PointsType.EARN
-        ).scalar() or 0
-        total_spent = db.query(func.sum(models.PointsRecord.points_amount)).filter(
-            models.PointsRecord.volunteer_id == volunteer.id,
-            models.PointsRecord.points_type == models.PointsType.SPEND
-        ).scalar() or 0
+        def _ledger_sum(types):
+            return db.query(func.sum(models.PointsRecord.points_amount)).filter(
+                models.PointsRecord.volunteer_id == volunteer.id,
+                models.PointsRecord.points_type.in_(types)
+            ).scalar() or 0
+
+        total_earned = _ledger_sum([
+            models.PointsType.EARN, models.PointsType.SETTLE_REFUND])
+        total_spent = _ledger_sum([
+            models.PointsType.SPEND, models.PointsType.SETTLE_SPEND])
+        # 从流水重建余额与冻结额，与兑换预占账保持一致。
+        total_frozen = _ledger_sum([models.PointsType.FREEZE])
+        total_unfrozen = _ledger_sum([
+            models.PointsType.UNFREEZE, models.PointsType.SETTLE_SPEND])
         volunteer.points_balance = total_earned - total_spent
+        volunteer.points_frozen = max(0, total_frozen - total_unfrozen)
 
         if volunteer.star_level_id:
             existing_cert = db.query(models.StarCertificate).filter(
@@ -733,8 +740,14 @@ def seed_data(db: Session):
         ),
     ]
     db.add_all(benefits)
-
     db.commit()
+
+    # 初始库存逐笔入库流水，使可售库存/已承诺数量从第一笔起即可解释。
+    import exchange_service
+    for b in benefits:
+        exchange_service.record_initial_stock(db, b, remark="种子数据初始入库")
+    db.commit()
+
     print("种子数据创建完成！")
     print(f"  - 学校: {db.query(models.School).count()} 所")
     print(f"  - 星级标准: {db.query(models.StarLevel).count()} 个")
