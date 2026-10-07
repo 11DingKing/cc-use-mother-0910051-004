@@ -85,7 +85,8 @@ def create_service_record(record: schemas.ServiceRecordCreate, db: Session = Dep
             points=points_awarded,
             source=models.PointsSource.SERVICE_COMPLETION,
             description=f"完成讲解服务 {record.service_hours}小时",
-            service_record_id=db_record.id
+            service_record_id=db_record.id,
+            commit=False
         )
 
         if record.teacher_rating and record.teacher_rating >= 4:
@@ -97,7 +98,8 @@ def create_service_record(record: schemas.ServiceRecordCreate, db: Session = Dep
                     points=rating_points,
                     source=models.PointsSource.TEACHER_RATING,
                     description=f"老师好评 {record.teacher_rating}星",
-                    service_record_id=db_record.id
+                    service_record_id=db_record.id,
+                    commit=False
                 )
 
     db.commit()
@@ -126,16 +128,21 @@ def update_service_record(record_id: int, record_update: schemas.ServiceRecordCr
     record.points_awarded = new_points
 
     if old_points != new_points:
-        from routers.points import spend_points
+        from routers.points import spend_points, PointsError
         if old_points > 0:
-            spend_points(
-                db=db,
-                volunteer_id=record.volunteer_id,
-                points=old_points,
-                source=models.PointsSource.OTHER,
-                description="服务记录更新，扣除原积分",
-                service_record_id=record.id
-            )
+            try:
+                spend_points(
+                    db=db,
+                    volunteer_id=record.volunteer_id,
+                    points=old_points,
+                    source=models.PointsSource.OTHER,
+                    description="服务记录更新，扣除原积分",
+                    service_record_id=record.id,
+                    commit=False
+                )
+            except PointsError as exc:
+                db.rollback()
+                raise HTTPException(status_code=400, detail=str(exc))
         if new_points > 0:
             add_points(
                 db=db,
@@ -143,7 +150,8 @@ def update_service_record(record_id: int, record_update: schemas.ServiceRecordCr
                 points=new_points,
                 source=models.PointsSource.SERVICE_COMPLETION,
                 description=f"更新讲解服务 {record.service_hours}小时",
-                service_record_id=record.id
+                service_record_id=record.id,
+                commit=False
             )
 
             if record.teacher_rating and record.teacher_rating >= 4:
@@ -155,7 +163,8 @@ def update_service_record(record_id: int, record_update: schemas.ServiceRecordCr
                         points=rating_points,
                         source=models.PointsSource.TEACHER_RATING,
                         description=f"老师好评 {record.teacher_rating}星",
-                        service_record_id=record.id
+                        service_record_id=record.id,
+                        commit=False
                     )
 
     db.commit()
@@ -175,15 +184,20 @@ def delete_service_record(record_id: int, db: Session = Depends(get_db)):
     points_to_deduct = record.points_awarded or 0
 
     if points_to_deduct > 0:
-        from routers.points import spend_points
-        spend_points(
-            db=db,
-            volunteer_id=vid,
-            points=points_to_deduct,
-            source=models.PointsSource.OTHER,
-            description="删除服务记录，扣除积分",
-            service_record_id=record.id
-        )
+        from routers.points import spend_points, PointsError
+        try:
+            spend_points(
+                db=db,
+                volunteer_id=vid,
+                points=points_to_deduct,
+                source=models.PointsSource.OTHER,
+                description="删除服务记录，扣除积分",
+                service_record_id=record.id,
+                commit=False
+            )
+        except PointsError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc))
 
     db.delete(record)
     db.commit()

@@ -467,15 +467,23 @@ def get_points_by_source(db: Session = Depends(get_db)):
 def get_exchange_stats(db: Session = Depends(get_db)):
     total_exchanges = db.query(func.count(models.BenefitExchange.id)).scalar() or 0
     pending_exchanges = db.query(func.count(models.BenefitExchange.id)).filter(
-        models.BenefitExchange.status == models.ExchangeStatus.PENDING
+        models.BenefitExchange.status == models.ExchangeStatus.RESERVED
     ).scalar() or 0
     completed_exchanges = db.query(func.count(models.BenefitExchange.id)).filter(
-        models.BenefitExchange.status == models.ExchangeStatus.COMPLETED
+        models.BenefitExchange.status.in_([
+            models.ExchangeStatus.CONFIRMED,
+            models.ExchangeStatus.PARTIALLY_FULFILLED,
+            models.ExchangeStatus.FULFILLED,
+        ])
     ).scalar() or 0
     cancelled_exchanges = db.query(func.count(models.BenefitExchange.id)).filter(
-        models.BenefitExchange.status == models.ExchangeStatus.CANCELLED
+        models.BenefitExchange.status.in_([
+            models.ExchangeStatus.CANCELLED, models.ExchangeStatus.REJECTED,
+        ])
     ).scalar() or 0
-    total_points_spent = db.query(func.sum(models.BenefitExchange.points_spent)).scalar() or 0
+    total_points_spent = db.query(
+        func.coalesce(func.sum(models.BenefitExchange.points_consumed), 0)
+    ).scalar() or 0
 
     return schemas.ExchangeStats(
         total_exchanges=total_exchanges,
@@ -490,16 +498,20 @@ def get_exchange_stats(db: Session = Depends(get_db)):
 def get_exchange_by_benefit(db: Session = Depends(get_db)):
     benefits = db.query(models.Benefit).all()
     result = []
+    open_statuses = [
+        models.ExchangeStatus.RESERVED, models.ExchangeStatus.CONFIRMED,
+        models.ExchangeStatus.PARTIALLY_FULFILLED, models.ExchangeStatus.FULFILLED,
+    ]
 
     for benefit in benefits:
         exchanges = db.query(models.BenefitExchange).filter(
             models.BenefitExchange.benefit_id == benefit.id,
-            models.BenefitExchange.status != models.ExchangeStatus.CANCELLED
+            models.BenefitExchange.status.in_(open_statuses)
         ).all()
 
         total_exchanged = len(exchanges)
         total_quantity = sum(e.quantity for e in exchanges)
-        total_points = sum(e.points_spent for e in exchanges)
+        total_points = sum(e.points_consumed for e in exchanges)
 
         result.append(schemas.BenefitStats(
             benefit_id=benefit.id,
@@ -539,11 +551,15 @@ def get_monthly_exchange_stats(year: int = None, months: int = 12, db: Session =
             and_(
                 models.BenefitExchange.created_at >= month_start,
                 models.BenefitExchange.created_at <= month_end,
-                models.BenefitExchange.status == models.ExchangeStatus.COMPLETED
+                models.BenefitExchange.status.in_([
+                    models.ExchangeStatus.CONFIRMED,
+                    models.ExchangeStatus.PARTIALLY_FULFILLED,
+                    models.ExchangeStatus.FULFILLED,
+                ])
             )
         ).scalar() or 0
 
-        total_points = db.query(func.sum(models.BenefitExchange.points_spent)).filter(
+        total_points = db.query(func.sum(models.BenefitExchange.points_consumed)).filter(
             and_(
                 models.BenefitExchange.created_at >= month_start,
                 models.BenefitExchange.created_at <= month_end

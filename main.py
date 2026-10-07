@@ -49,6 +49,14 @@ def root():
             "完成讲解：每小时10积分",
             "老师好评：4星+5积分，5星+10积分"
         ],
+        "exchange_flow": [
+            "申请兑换(POST /api/benefits/exchanges, 带 Idempotency-Key)：同一事务内原子冻结积分(FREEZE)与预占库存(RESERVE)",
+            "后台确认(/confirm)：优先时段券立即发资格(资格在真正认领时段 /entitlements/consume 时才消费)；实物进入已确认等待发货",
+            "实物发货(/fulfill)：支持部分履约，未发部分按 库存不足 原因释放积分与库存",
+            "拒绝(/reject)/家长取消(/cancel)/超时(/exchanges-timeouts/sweep)：按明确原因解冻积分、释放库存",
+            "重复请求凭幂等键返回同一结果，载荷变化返回 409；人工更正只能 POST /compensations 追加补偿",
+            "任何时刻可用 /reconciliation/points 与 /reconciliation/inventory 从流水核对可用积分、冻结积分、可售库存与已承诺数量"
+        ],
         "api_groups": [
             "志愿者管理 (/api/volunteers)",
             "培训管理 - 期次/课次/报名入班/课次出勤 (/api/trainings/batches, /sessions, /enrollments)",

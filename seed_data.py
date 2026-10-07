@@ -70,16 +70,48 @@ def recompute_volunteer_hours(db: Session):
 
     db.flush()
 
+    # 为积分流水账补开 EARN 流水（新库初始化 / 旧库迁移），
+    # 使"可用积分 = 流水汇总"在初始化后立即成立。
     for volunteer in volunteers:
-        total_earned = db.query(func.sum(models.PointsRecord.points_amount)).filter(
+        has_ledger = db.query(models.PointsLedger.id).filter(
+            models.PointsLedger.volunteer_id == volunteer.id
+        ).first()
+        if has_ledger:
+            continue
+        earn_records = db.query(models.PointsRecord).filter(
             models.PointsRecord.volunteer_id == volunteer.id,
-            models.PointsRecord.points_type == models.PointsType.EARN
-        ).scalar() or 0
-        total_spent = db.query(func.sum(models.PointsRecord.points_amount)).filter(
+            models.PointsRecord.points_type == models.PointsType.EARN,
+        ).all()
+        for pr in earn_records:
+            db.add(models.PointsLedger(
+                volunteer_id=volunteer.id,
+                ledger_type=models.PointsLedgerType.EARN,
+                amount=pr.points_amount,
+                ref_type="service_record",
+                ref_id=pr.service_record_id or pr.id,
+                description=pr.description or "期初积分",
+            ))
+        spend_records = db.query(models.PointsRecord).filter(
             models.PointsRecord.volunteer_id == volunteer.id,
-            models.PointsRecord.points_type == models.PointsType.SPEND
-        ).scalar() or 0
-        volunteer.points_balance = total_earned - total_spent
+            models.PointsRecord.points_type == models.PointsType.SPEND,
+        ).all()
+        for pr in spend_records:
+            db.add(models.PointsLedger(
+                volunteer_id=volunteer.id,
+                ledger_type=models.PointsLedgerType.SPEND,
+                amount=pr.points_amount,
+                ref_type="service_record",
+                ref_id=pr.service_record_id or pr.id,
+                description=pr.description or "期初扣减",
+            ))
+        earn_total = sum(pr.points_amount for pr in earn_records)
+        spend_total = sum(pr.points_amount for pr in spend_records)
+        volunteer.points_balance = earn_total - spend_total
+        volunteer.frozen_points = 0
+
+    db.flush()
+
+    for volunteer in volunteers:
 
         if volunteer.star_level_id:
             existing_cert = db.query(models.StarCertificate).filter(

@@ -53,6 +53,8 @@ def get_parent_view(volunteer_id: int, parent_phone: str = None, db: Session = D
         star_level_name=star_level_name,
         total_service_hours=volunteer.total_service_hours or 0.0,
         points_balance=volunteer.points_balance or 0,
+        frozen_points=volunteer.frozen_points or 0,
+        available_points=volunteer.points_balance or 0,
         registration_date=volunteer.registration_date,
         certification_date=volunteer.certification_date
     )

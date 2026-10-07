@@ -3,7 +3,8 @@ from datetime import date, datetime
 from typing import Optional, List
 from models import (
     VolunteerStatus, AssessmentResult, TimeSlotStatus, TrainingBatchStatus, EnrollmentStatus,
-    PointsType, PointsSource, BenefitType, ExchangeStatus
+    PointsType, PointsSource, BenefitType, ExchangeStatus, ExchangeReleaseReason,
+    PointsLedgerType, EntitlementStatus
 )
 
 
@@ -78,6 +79,8 @@ class Volunteer(VolunteerBase):
     status: VolunteerStatus
     star_level_id: Optional[int] = None
     total_service_hours: float
+    points_balance: int = 0
+    frozen_points: int = 0
     registration_date: date
     certification_date: Optional[date] = None
     created_at: datetime
@@ -629,6 +632,8 @@ class VolunteerPoints(BaseModel):
     volunteer_id: int
     name: str
     points_balance: int
+    frozen_points: int = 0
+    available_points: int = 0
     total_earned: int
     total_spent: int
 
@@ -639,6 +644,8 @@ class BenefitBase(BaseModel):
     description: Optional[str] = None
     points_cost: int
     stock: int = 0
+    allow_partial_fulfillment: bool = False
+    reserve_timeout_seconds: int = 900
     is_active: bool = True
     image_url: Optional[str] = None
     sort_order: int = 0
@@ -654,6 +661,8 @@ class BenefitUpdate(BaseModel):
     description: Optional[str] = None
     points_cost: Optional[int] = None
     stock: Optional[int] = None
+    allow_partial_fulfillment: Optional[bool] = None
+    reserve_timeout_seconds: Optional[int] = None
     is_active: Optional[bool] = None
     image_url: Optional[str] = None
     sort_order: Optional[int] = None
@@ -667,30 +676,66 @@ class Benefit(BenefitBase):
         from_attributes = True
 
 
+class BenefitAvailability(BaseModel):
+    """商品实时可售视图：可售库存与已承诺数量均可由库存流水解释。"""
+    benefit_id: int
+    name: str
+    benefit_type: BenefitType
+    points_cost: int
+    stock: int                  # 商品初始/盘点库存（未扣减）
+    reserved_quantity: int      # 已预占未决（已承诺）
+    sold_quantity: int          # 已履约售出
+    available_quantity: int     # 可售 = stock - reserved - sold
+    allow_partial_fulfillment: bool
+    is_active: bool
+
+
 class BenefitExchangeBase(BaseModel):
     volunteer_id: int
     benefit_id: int
     quantity: int = 1
 
 
-class BenefitExchangeCreate(BenefitExchangeBase):
+class BenefitExchangeApply(BenefitExchangeBase):
     delivery_info: Optional[str] = None
     notes: Optional[str] = None
+    # 客户端幂等键：相同请求重复到达返回同一结果；缺失时服务端以业务指纹兜底
+    idempotency_key: Optional[str] = None
 
 
-class BenefitExchangeUpdate(BaseModel):
-    status: Optional[ExchangeStatus] = None
+class BenefitExchangeConfirm(BaseModel):
+    # 后台确认发放。实物可指定本次履约数量（部分履约）；优先时段券确认即发资格
+    fulfill_quantity: Optional[int] = None
     delivery_info: Optional[str] = None
     notes: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class BenefitExchangeReject(BaseModel):
+    reason: str = "后台拒绝"
+    notes: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class BenefitExchangeCancel(BaseModel):
+    reason: str = "用户取消"
+    idempotency_key: Optional[str] = None
 
 
 class BenefitExchange(BaseModel):
     id: int
     volunteer_id: int
     benefit_id: int
+    points_cost: int
     points_spent: int
     status: ExchangeStatus
     quantity: int
+    fulfilled_quantity: int = 0
+    points_consumed: int = 0
+    points_refunded: int = 0
+    close_reason: Optional[ExchangeReleaseReason] = None
+    reserve_expires_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
     delivery_info: Optional[str] = None
     fulfilled_at: Optional[datetime] = None
     notes: Optional[str] = None
@@ -698,9 +743,123 @@ class BenefitExchange(BaseModel):
     updated_at: datetime
     volunteer: Optional["Volunteer"] = None
     benefit: Optional[Benefit] = None
+    entitlements: List["PriorityEntitlement"] = []
 
     class Config:
         from_attributes = True
+
+
+class PointsLedger(BaseModel):
+    id: int
+    volunteer_id: int
+    ledger_type: PointsLedgerType
+    amount: int
+    reason: Optional[ExchangeReleaseReason] = None
+    ref_type: Optional[str] = None
+    ref_id: Optional[int] = None
+    idempotency_key: Optional[str] = None
+    description: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class InventoryRecord(BaseModel):
+    id: int
+    benefit_id: int
+    exchange_id: Optional[int] = None
+    action: str
+    quantity: int
+    committed_delta: int
+    reason: Optional[ExchangeReleaseReason] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PriorityEntitlement(BaseModel):
+    id: int
+    volunteer_id: int
+    benefit_id: int
+    exchange_id: int
+    time_slot_id: Optional[int] = None
+    status: EntitlementStatus
+    code: str
+    used_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class EntitlementConsume(BaseModel):
+    volunteer_id: int
+    time_slot_id: int
+    idempotency_key: Optional[str] = None
+
+
+class ManualCompensationCreate(BaseModel):
+    exchange_id: Optional[int] = None
+    volunteer_id: int
+    benefit_id: Optional[int] = None
+    points_delta: int = 0       # 带符号：补还为正，扣回为负
+    inventory_delta: int = 0    # 带符号：补库存为正
+    reason: str
+    operator: Optional[str] = None
+
+
+class ManualCompensation(BaseModel):
+    id: int
+    exchange_id: Optional[int] = None
+    volunteer_id: int
+    benefit_id: Optional[int] = None
+    points_delta: int
+    inventory_delta: int
+    reason: str
+    operator: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ExchangeTimeline(BaseModel):
+    """单笔兑换的完整解释轨迹：状态、积分流水、库存流水、资格、补偿。"""
+    exchange: BenefitExchange
+    points_ledgers: List[PointsLedger] = []
+    inventory_records: List[InventoryRecord] = []
+    entitlements: List[PriorityEntitlement] = []
+    compensations: List[ManualCompensation] = []
+
+
+class PointsReconciliation(BaseModel):
+    """积分对账结果：余额/冻结均由不可变流水逐笔解释。"""
+    volunteer_id: int
+    name: str
+    points_balance: int        # 账户当前余额
+    frozen_points: int         # 冻结积分
+    available_points: int      # 可用积分 = balance - frozen
+    ledger_total: int          # 流水汇总余额
+    ledger_frozen: int         # 流水汇总冻结
+    consistent: bool
+
+
+class InventoryReconciliationItem(BaseModel):
+    benefit_id: int
+    name: str
+    stock: int
+    reserved_quantity: int
+    sold_quantity: int
+    available_quantity: int
+    open_reserved_quantity: int   # 未决兑换（已预占/已确认/部分履约）占用
+    consistent: bool
+
+
+class InventoryReconciliation(BaseModel):
+    items: List[InventoryReconciliationItem]
+    consistent: bool
 
 
 class StarCertificateBase(BaseModel):
@@ -741,6 +900,8 @@ class ParentVolunteerSummary(BaseModel):
     star_level_name: Optional[str] = None
     total_service_hours: float
     points_balance: int
+    frozen_points: int = 0
+    available_points: int = 0
     registration_date: date
     certification_date: Optional[date] = None
 
